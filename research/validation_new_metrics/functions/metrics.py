@@ -1,11 +1,7 @@
 import pandas as pd
 import datetime as dt
 import numpy as np
-import glob
-import os
-import matplotlib.pyplot as plt
-import seaborn as sns
-import warnings
+import ruptures as rpt
 
 
 def month_calendar(data):
@@ -27,6 +23,19 @@ def MAU(data):
     #нужно добавить название столбца
     mau = data.groupby('month')['author_id'].nunique().reset_index(name='mau')
     return mau
+
+def number_of_posts(data):
+    data = data.copy()
+    data['created_at'] = pd.to_datetime(data['created_at'])
+    data['month'] = data['created_at'].dt.to_period('M')
+
+    result = (
+        data.groupby('month')
+        .size()
+        .reset_index(name='number_of_posts_per_month')
+    )
+
+    return result
 
 
 def new_user_d7_retention(data):
@@ -294,7 +303,6 @@ def percentage_new_users_receiving_first_reply(data):
 
 def median_time_to_first_reply(data):
     data = data.copy()
-
     data['created_at'] = pd.to_datetime(data['created_at'])
     data['month'] = data['created_at'].dt.to_period('M')
 
@@ -321,11 +329,8 @@ def median_time_to_first_reply(data):
         .reset_index()
     )
 
-    question_replies = questions.merge(
-        first_replies,
-        on='question_id',
-        how='inner'
-    )
+    # LEFT JOIN: вопросы без ответа получают NaN → попадают в расчёт как +inf
+    question_replies = questions.merge(first_replies, on='question_id', how='left')
 
     question_replies['time_to_first_reply_hours'] = (
         question_replies['reply_created_at']
@@ -376,15 +381,13 @@ def median_time_to_be_answered(data):
     )
 
     question_answers = questions.merge(
-        first_accepted_answers,
-        on='question_id',
-        how='inner'
+        first_accepted_answers, on='question_id', how='left'
     )
-
     question_answers['time_to_be_answered_hours'] = (
         question_answers['answered_at']
         - question_answers['question_created_at']
     ).dt.total_seconds() / 3600
+
 
     result = (
         question_answers
@@ -509,143 +512,119 @@ def core_contribution_share(data, top_percent=0.05):
     data['month'] = data['created_at'].dt.to_period('M')
 
     monthly_user_content = (
-        data
-        .groupby(['month', 'author_id'])
+        data.groupby(['month', 'author_id'])
         .size()
         .reset_index(name='content_count')
     )
 
-    results = []
+    monthly_user_content['rank'] = (
+        monthly_user_content
+        .groupby('month')['content_count']
+        .rank(method='first', ascending=False)
+    )
 
-    for month, month_data in monthly_user_content.groupby('month'):
-        month_data = month_data.sort_values(
-            'content_count',
-            ascending=False
-        )
+    monthly_totals = (
+        monthly_user_content
+        .groupby('month')['content_count']
+        .sum()
+        .rename('total_content')
+    )
 
-        top_n = max(1, int(len(month_data) * top_percent))
+    monthly_counts = (
+        monthly_user_content
+        .groupby('month')['author_id']
+        .nunique()
+        .rename('user_count')
+    )
 
-        top_content = month_data.head(top_n)['content_count'].sum()
-        total_content = month_data['content_count'].sum()
+    monthly_user_content = (
+        monthly_user_content
+        .join(monthly_totals, on='month')
+        .join(monthly_counts, on='month')
+    )
 
-        share = top_content / total_content * 100
+    monthly_user_content['top_n'] = (
+        (monthly_user_content['user_count'] * top_percent)
+        .clip(lower=1)
+        .astype(int)
+    )
 
-        results.append({
-            'month': month,
-            'core_contribution_share': share
-        })
+    top_users = monthly_user_content[
+        monthly_user_content['rank'] <= monthly_user_content['top_n']
+    ]
 
-    return pd.DataFrame(results)
+    result = (
+        (top_users.groupby('month')['content_count'].sum() / monthly_totals * 100)
+        .reset_index(name='core_contribution_share')
+    )
+
+    return result
 
 
 def reactivated_users_count(data, inactive_months=2):
     data = data.copy()
-
     data['created_at'] = pd.to_datetime(data['created_at'])
     data['month'] = data['created_at'].dt.to_period('M')
 
-    monthly_users = (
-        data[['month', 'author_id']]
-        .drop_duplicates()
-        .sort_values(['author_id', 'month'])
+    monthly_users = data[['month', 'author_id']].drop_duplicates()
+    monthly_users['active'] = True
+
+    # Матрица month × user: True если активен в этом месяце
+    pivot = (
+        monthly_users
+        .pivot_table(index='month', columns='author_id', values='active', fill_value=False)
+        .sort_index()
+        .astype(bool)
     )
 
-    results = []
+    # Был активен хотя бы в одном из inactive_months предыдущих месяцев?
+    in_inactive_window = pd.DataFrame(False, index=pivot.index, columns=pivot.columns)
+    for i in range(1, inactive_months + 1):
+        in_inactive_window |= pivot.shift(i).fillna(False).astype(bool)
 
-    all_months = sorted(monthly_users['month'].unique())
+    # Был активен хотя бы раз ДО окна неактивности?
+    was_active_before = (
+        pivot.cumsum()
+             .shift(inactive_months + 1)
+             .fillna(0)
+             .gt(0)
+    )
 
-    for month in all_months:
-        current_users = set(
-            monthly_users[monthly_users['month'] == month]['author_id']
-        )
+    # Реактивация: активен сейчас + пропустил окно + был до него
+    reactivated = pivot & ~in_inactive_window & was_active_before
 
-        inactive_period = [
-            month - i
-            for i in range(1, inactive_months + 1)
-        ]
+    result = (
+        reactivated
+        .sum(axis=1)
+        .reset_index(name='reactivated_users_count')
+    )
+    result['reactivated_users_count'] = result['reactivated_users_count'].astype(int)
 
-        inactive_period_users = set(
-            monthly_users[
-                monthly_users['month'].isin(inactive_period)
-            ]['author_id']
-        )
-
-        previous_users = set(
-            monthly_users[
-                monthly_users['month'] < min(inactive_period)
-            ]['author_id']
-        )
-
-        reactivated_users = (
-            current_users
-            - inactive_period_users
-        ) & previous_users
-
-        results.append({
-            'month': month,
-            'reactivated_users_count': len(reactivated_users)
-        })
-
-    return pd.DataFrame(results)
-
-
-def add_mom_yoy(data, metric_column=None):
-    data = data.copy()
-
-    if 'month' not in data.columns:
-        raise ValueError(f"Column 'month' not found. Available columns: {list(data.columns)}")
-
-    if metric_column is None:
-        metric_columns = [col for col in data.columns if col != 'month']
-
-        if len(metric_columns) != 1:
-            raise ValueError(
-                f"Could not detect metric column automatically. "
-                f"Found metric columns: {metric_columns}. "
-                f"Pass metric_column manually."
-            )
-
-        metric_column = metric_columns[0]
-
-    data['month'] = data['month'].astype(str)
-    data['month'] = pd.PeriodIndex(data['month'], freq='M')
-
-    data = data.sort_values('month').reset_index(drop=True)
-
-    for period, suffix in [(1, 'mom'), (12, 'yoy')]:
-        previous = data[metric_column].shift(period)
-        current = data[metric_column]
-
-        change = ((current - previous) / previous) * 100
-
-        change = change.mask((previous == 0) & (current > 0), 100)
-        change = change.mask((previous == 0) & (current == 0), 0)
-
-        change = change.replace([np.inf, -np.inf], np.nan)
-
-        data[f'{metric_column}_{suffix}'] = change
-
-    return data
-
+    return result
 
 def resolution_rate(data):
     data = data.copy()
-
     data['created_at'] = pd.to_datetime(data['created_at'])
     data['month'] = data['created_at'].dt.to_period('M')
 
     questions = (
         data[data['post_type'] == 1][['id', 'month']]
-        .rename(columns={
-            'id': 'question_id',
-            'month': 'question_month'
-        })
+        .rename(columns={'id': 'question_id', 'month': 'question_month'})
+    )
+
+    # Единая нормализация — как в answered_but_unresolved_rate
+    data['is_accepted_answer_clean'] = (
+        data['is_accepted_answer']
+        .fillna(False)
+        .astype(str)
+        .str.lower()
+        .isin(['true', '1', '1.0'])
     )
 
     accepted_answers = (
         data[
             (data['post_type'] == 2) &
-            (data['is_accepted_answer'] == True)
+            (data['is_accepted_answer_clean'])
         ][['parent_id']]
         .drop_duplicates()
         .rename(columns={'parent_id': 'question_id'})
@@ -827,20 +806,12 @@ def stickiness(data):
 
     return result
 
-def _prepare_chat_data(data):
+def newcomer_response_metrics(data, no_response_window_hours=1, first_day_hours=24):
     data = data.copy()
+
     data['created_at'] = pd.to_datetime(data['created_at'], format='mixed')
     data['month'] = data['created_at'].dt.to_period('M')
-
-    return data.sort_values(['topic_id', 'created_at']).reset_index(drop=True)
-
-
-def newcomer_response_metrics_fast(
-    data,
-    no_response_window_hours=1,
-    first_day_hours=24
-):
-    data = _prepare_chat_data(data)
+    data = data.sort_values(['topic_id', 'created_at']).reset_index(drop=True)
 
     first_message_at = data.groupby('author_id')['created_at'].transform('min')
 
@@ -848,38 +819,35 @@ def newcomer_response_metrics_fast(
         data[data['created_at'] == first_message_at]
         .sort_values('created_at')
         .drop_duplicates('author_id')
+        [['author_id', 'topic_id', 'created_at', 'month']]
         .copy()
     )
 
-    replies = first_messages[['author_id', 'topic_id', 'created_at']].merge(
-        data[['topic_id', 'author_id', 'created_at']],
-        on='topic_id',
-        how='left',
-        suffixes=('_newcomer', '_reply')
+    # Только топики, где новичок написал первое сообщение — сужаем правую часть join'а
+    newcomer_topics = first_messages[['author_id', 'topic_id', 'created_at']].rename(
+        columns={'author_id': 'newcomer_id', 'created_at': 'newcomer_at'}
     )
 
-    replies = replies[
-        (replies['author_id_reply'] != replies['author_id_newcomer']) &
-        (replies['created_at_reply'] > replies['created_at_newcomer'])
+    candidate_replies = (
+        data[data['topic_id'].isin(newcomer_topics['topic_id'].unique())]
+        [['topic_id', 'author_id', 'created_at']]
+    )
+
+    combined = newcomer_topics.merge(candidate_replies, on='topic_id')
+    combined = combined[
+        (combined['author_id'] != combined['newcomer_id']) &
+        (combined['created_at'] > combined['newcomer_at'])
     ]
 
     first_replies = (
-        replies
-        .groupby(['author_id_newcomer', 'topic_id', 'created_at_newcomer'])['created_at_reply']
+        combined
+        .groupby('newcomer_id')['created_at']   # groupby по одному полю вместо трёх
         .min()
         .reset_index()
-        .rename(columns={
-            'author_id_newcomer': 'author_id',
-            'created_at_newcomer': 'created_at',
-            'created_at_reply': 'first_response_at'
-        })
+        .rename(columns={'newcomer_id': 'author_id', 'created_at': 'first_response_at'})
     )
 
-    first_messages = first_messages.merge(
-        first_replies,
-        on=['author_id', 'topic_id', 'created_at'],
-        how='left'
-    )
+    first_messages = first_messages.merge(first_replies, on='author_id', how='left')
 
     first_messages['response_time_minutes'] = (
         first_messages['first_response_at'] - first_messages['created_at']
@@ -888,7 +856,6 @@ def newcomer_response_metrics_fast(
     first_messages['has_response_1h'] = (
         first_messages['response_time_minutes'] <= no_response_window_hours * 60
     )
-
     first_messages['has_response_24h'] = (
         first_messages['response_time_minutes'] <= first_day_hours * 60
     )
@@ -898,17 +865,14 @@ def newcomer_response_metrics_fast(
         .groupby('month')
         .agg(
             newcomer_no_response_rate_1h=(
-                'has_response_1h',
-                lambda x: (~x).mean() * 100
+                'has_response_1h', lambda x: (~x.fillna(True)).mean() * 100
             ),
             newcomer_median_time_to_first_response_minutes=(
-                'response_time_minutes',
-                'median'
+                'response_time_minutes', 'median'
             ),
             newcomer_first_day_response_rate=(
-                'has_response_24h',
-                lambda x: x.mean() * 100
-            )
+                'has_response_24h', lambda x: x.fillna(False).mean() * 100
+            ),
         )
         .reset_index()
     )
@@ -932,3 +896,195 @@ def average_thread_messages(data):
     )
 
     return result
+
+def newcomer_no_response_rate_20h(data):
+    data = data.copy()
+    data['created_at'] = pd.to_datetime(data['created_at'])
+    data['month'] = data['created_at'].dt.to_period('M')
+
+    # Первое сообщение каждого пользователя
+    first_messages = (
+        data.sort_values('created_at')
+        .groupby('author_id')
+        .first()
+        .reset_index()
+        [['author_id', 'id', 'created_at', 'month', 'topic_id']]
+    )
+
+    # Все сообщения от других пользователей в тех же топиках
+    candidate_replies = (
+        data[data['topic_id'].isin(first_messages['topic_id'].unique())]
+        [['topic_id', 'author_id', 'created_at']]
+    )
+
+    combined = first_messages.merge(
+        candidate_replies,
+        on='topic_id',
+        suffixes=('_newcomer', '_reply')
+    )
+
+    # Только ответы от других пользователей после первого сообщения
+    combined = combined[
+        (combined['author_id_reply'] != combined['author_id_newcomer']) &
+        (combined['created_at_reply'] > combined['created_at_newcomer'])
+    ]
+
+    # Первый ответ каждому новичку
+    first_replies = (
+        combined
+        .groupby('author_id_newcomer')['created_at_reply']
+        .min()
+        .reset_index()
+        .rename(columns={
+            'author_id_newcomer': 'author_id',
+            'created_at_reply': 'first_reply_at'
+        })
+    )
+
+    first_messages = first_messages.merge(first_replies, on='author_id', how='left')
+
+    first_messages['response_time_hours'] = (
+        first_messages['first_reply_at'] - first_messages['created_at']
+    ).dt.total_seconds() / 3600
+
+    # Не ответили за 20 часов = нет ответа вообще или ответ позже 20ч
+    first_messages['no_response_20h'] = (
+        first_messages['response_time_hours'].isna() |
+        (first_messages['response_time_hours'] > 20)
+    )
+
+    result = (
+        first_messages
+        .groupby('month')['no_response_20h']
+        .mean()
+        .mul(100)
+        .reset_index(name='newcomer_no_response_rate_20h')
+    )
+
+    return result
+
+METRIC_REGISTRY = {
+    'newcomer_no_response_rate_1h': {
+        'label':       'Доля новичков без ответа за 1 час',
+        'direction':   'decrease',   # чем ниже тем лучше
+        'actionable':  True,         # менеджер влияет напрямую
+        'explanation': 'Быстрый ответ повышает шанс что новичок вернётся',
+    },
+    'newcomer_no_response_rate_20h': {
+        'label':       'Доля новичков без ответа за 20 часов',
+        'direction':   'decrease',
+        'actionable':  True,
+        'explanation': 'Отсутствие ответа в первый день снижает активацию',
+    },
+    'new_user_activation_rate_7d': {
+        'label':       'Активация новичков за 7 дней',
+        'direction':   'increase',
+        'actionable':  True,
+        'explanation': 'Активация в первую неделю предсказывает долгосрочное удержание',
+    },
+    'median_time_to_first_reply_hours': {
+        'label':       'Медианное время до первого ответа (часы)',
+        'direction':   'decrease',
+        'actionable':  True,
+        'explanation': 'Скорость ответа влияет на опыт новичка',
+    },
+    'median_time_to_be_answered_hours': {
+        'label':       'Медианное время до принятого ответа (часы)',
+        'direction':   'decrease',
+        'actionable':  True,
+        'explanation': 'Актуально для Q&A — скорость решения вопроса',
+    },
+    'newcomer_median_time_to_first_response_minutes': {
+        'label':       'Медианное время ответа новичку (минуты)',
+        'direction':   'decrease',
+        'actionable':  True,
+        'explanation': 'Чем быстрее первый ответ тем выше вероятность возврата',
+    },
+    'newcomer_first_day_response_rate': {
+        'label':       'Доля новичков с ответом в первый день',
+        'direction':   'increase',
+        'actionable':  True,
+        'explanation': 'Ответ в первый день критичен для активации',
+    },
+    'unanswered_rate': {
+        'label':       'Доля вопросов без ответа',
+        'direction':   'decrease',
+        'actionable':  True,
+        'explanation': 'Вопросы без ответа снижают ценность сообщества',
+    },
+    'resolution_rate': {
+        'label':       'Доля решённых вопросов',
+        'direction':   'increase',
+        'actionable':  True,
+        'explanation': 'Решённые вопросы повышают полезность Q&A',
+    },
+    'average_thread_messages': {
+        'label':       'Среднее сообщений в треде',
+        'direction':   'increase',
+        'actionable':  False,  # следствие вовлечённости, не рычаг
+        'explanation': 'Длинные треды — признак живого обсуждения',
+    },
+    # Лаговые индикаторы — не рычаги
+    'd7': {
+        'label':       'Retention D7',
+        'direction':   'increase',
+        'actionable':  False,
+        'explanation': 'Удержание через 7 дней — результат онбординга',
+    },
+    'd30': {
+        'label':       'Retention D30',
+        'direction':   'increase',
+        'actionable':  False,
+        'explanation': 'Удержание через 30 дней — долгосрочный показатель',
+    },
+    'monthly_retention': {
+        'label':       'Месячное удержание',
+        'direction':   'increase',
+        'actionable':  False,
+        'explanation': 'Доля пользователей вернувшихся в следующем месяце',
+    },
+    'reactivated_users_count': {
+        'label':       'Реактивированные пользователи',
+        'direction':   'increase',
+        'actionable':  False,
+        'explanation': 'Зависит от размера сообщества',
+    },
+    'number_of_posts_discussions': {
+        'label':       'Число новых обсуждений',
+        'direction':   'increase',
+        'actionable':  False,
+        'explanation': 'Следствие активности, не источник',
+    },
+    'stickiness': {
+        'label':       'Stickiness (DAU/MAU)',
+        'direction':   'increase',
+        'actionable':  False,
+        'explanation': 'Результирующий показатель вовлечённости',
+    },
+    'core_contribution_share': {
+        'label':       'Доля контента от ядра',
+        'direction':   'increase',
+        'actionable':  False,
+        'explanation': 'Информационный показатель',
+    },
+    'average_replies_per_discussion': {
+        'label':       'Среднее ответов на обсуждение',
+        'direction':   'increase',
+        'actionable':  False,
+        'explanation': 'Следствие активности сообщества',
+    },
+        'newcomer_no_response_rate_20h': {
+        'label':       'Доля новичков без ответа за 20 часов',
+        'direction':   'decrease',
+        'actionable':  True,
+        'explanation': 'Отсутствие ответа в первый день снижает активацию',
+        'is_new':      True,   # ← флаг новой метрики
+    },
+    'average_thread_messages': {
+        'label':       'Среднее сообщений в треде',
+        'direction':   'increase',
+        'actionable':  False,
+        'explanation': 'Длинные треды — признак живого обсуждения',
+        'is_new':      True,
+    }
+}
