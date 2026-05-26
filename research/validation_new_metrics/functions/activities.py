@@ -466,8 +466,6 @@ df_activities['hours_per_activity'] = rng.choice(
     size=len(df_activities),
 )
 
-print(df_activities)
-
 PREDICTOR_ACTIVITY_MAP = {
 
     'new_user_activation_rate_7d': {
@@ -580,10 +578,14 @@ for predictor, entry in PREDICTOR_ACTIVITY_MAP.items():
         })
 
 df_predictor_activity = pd.DataFrame(_records)
-print(df_predictor_activity)
 
 stage_to_segments = {
         'growth':     {'Lurker', 'Active Users'},
         'stagnation': {'Regular Users', 'Engaged Users'},
         'decline':    {'Core Users', 'Super Users', 'Engaged Users'},
     }
+
+
+if __name__ == '__main__':
+    print(df_activities)
+    print(df_predictor_activity)
